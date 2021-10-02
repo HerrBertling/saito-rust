@@ -3,7 +3,7 @@ use super::network::CHALLENGE_EXPIRATION_TIME;
 use crate::block::{Block, BlockType};
 use crate::blockchain::{Blockchain, GENESIS_PERIOD};
 use crate::crypto::{hash, verify, SaitoHash, SaitoPublicKey};
-use crate::mempool::{AddBlockResult, Mempool};
+use crate::mempool::Mempool;
 use crate::networking::message_types::handshake_challenge::HandshakeChallenge;
 use crate::networking::message_types::request_block_message::RequestBlockMessage;
 use crate::networking::message_types::request_blockchain_message::RequestBlockchainMessage;
@@ -330,15 +330,12 @@ impl SaitoPeer {
     // TODO Should this really be here? I don't think it's needed... let's just copy the
     // code in-place where it's called or at least put this somewhere else...
     pub async fn add_block_to_mempool(&mut self, block: Block) {
-        let mut mempool = self.mempool_lock.write().await;
-        match mempool.add_block_to_queue(block) {
-            AddBlockResult::Exists => {
-                println!("The node appears to be requesting blocks which is already has in it's mempool queue, this should probably be fixed...");
-            }
-            AddBlockResult::Accepted => {
-                // nothing to do
-            }
+        {
+            let mut mempool = self.mempool_lock.write().await;
+            mempool.add_block(block);
         }
+        Mempool::send_blocks_to_blockchain(self.mempool_lock.clone(), self.blockchain_lock.clone())
+            .await;
     }
     /// Handlers for all the network API commands, e.g. REQBLOCK.
     pub async fn handle_peer_command(peer: &mut SaitoPeer, api_message_orig: &APIMessage) {
@@ -457,20 +454,15 @@ impl SaitoPeer {
                                 let block = Block::deserialize_for_net(
                                     serialized_block_message.get_message_data(),
                                 );
-                                let mut mempool = mempool_lock.write().await;
-                                println!("ADDED TO MEMPOOL QUEUE");
-                                let result = mempool.add_block_to_queue(block);
-                                match result {
-                                    AddBlockResult::Accepted => {
-                                        println!("REQBLOCK Accepted");
-                                    }
-                                    AddBlockResult::Exists => {
-                                        event!(
-                                            Level::ERROR,
-                                            "REQBLOCK error, block already exists"
-                                        );
-                                    }
+                                {
+                                    let mut mempool = mempool_lock.write().await;
+                                    mempool.add_block(block);
                                 }
+                                Mempool::send_blocks_to_blockchain(
+                                    peer.mempool_lock.clone(),
+                                    peer.blockchain_lock.clone(),
+                                )
+                                .await;
                             }
                             Err(error_message) => {
                                 event!(
@@ -559,19 +551,16 @@ pub async fn handle_inbound_peer_connection(
                 let api_message = APIMessage::deserialize(&msg.as_bytes().to_vec());
                 SaitoPeer::handle_peer_message(api_message, connection_id).await;
             } else {
-                println!("Message of length 0... why?");
-                println!("This seems to occur if we aren't holding a reference to the sender/stream on the");
-                println!("other end of the connection. I suspect that when the stream goes out of scope,");
-                println!(
-                    "it's deconstructor is being called and sends a 0 length message to indicate"
+                event!(
+                    Level::ERROR,
+                    "Message of length 0... why?\n
+                    This seems to occur if we aren't holding a reference to the sender/stream on the\n
+                    other end of the connection. I suspect that when the stream goes out of scope,\n
+                    it's deconstructor is being called and sends a 0 length message to indicate\n
+                    that the stream has ended... I'm leaving this println here for now because\n
+                    it would be very helpful to see this if starts to occur again. We may want to\n
+                    treat this as a disconnect."
                 );
-                println!(
-                    "that the stream has ended... I'm leaving this println here for now because"
-                );
-                println!(
-                    "it would be very helpful to see this if starts to occur again. We may want to"
-                );
-                println!("treat this as a disconnect.");
             }
         }
         // We had some error. Remove all references to this peer.

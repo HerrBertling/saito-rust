@@ -19,18 +19,6 @@ use tracing::{event, Level};
 // attempts to bundle blocks and notify itself when a block has
 // been produced.
 //
-#[derive(Clone, PartialEq)]
-pub enum AddBlockResult {
-    Accepted,
-    Exists,
-}
-#[derive(Debug, Clone, PartialEq)]
-pub enum AddTransactionResult {
-    Accepted,
-    Rejected,
-    Invalid,
-    Exists,
-}
 #[derive(Clone, Debug)]
 pub enum MempoolMessage {
     LocalTryBundleBlock,
@@ -79,19 +67,6 @@ impl Mempool {
             // do nothing
         } else {
             self.blocks_queue.push_back(block);
-        }
-    }
-    pub fn add_block_to_queue(&mut self, block: Block) -> AddBlockResult {
-        let hash_to_insert = block.get_hash();
-        if self
-            .blocks_queue
-            .iter()
-            .any(|block| block.get_hash() == hash_to_insert)
-        {
-            AddBlockResult::Exists
-        } else {
-            self.blocks_queue.push_back(block);
-            AddBlockResult::Accepted
         }
     }
     pub async fn add_golden_ticket(&mut self, golden_ticket: GoldenTicket) {
@@ -283,6 +258,20 @@ impl Mempool {
     pub fn set_mempool_privatekey(&mut self, privatekey: SaitoPrivateKey) {
         self.mempool_privatekey = privatekey;
     }
+
+    pub async fn send_blocks_to_blockchain(
+        mempool_lock: Arc<RwLock<Mempool>>,
+        blockchain_lock: Arc<RwLock<Blockchain>>,
+    ) {
+        let mut mempool = mempool_lock.write().await;
+        mempool.currently_bundling_block = true;
+        let mut blockchain = blockchain_lock.write().await;
+        while let Some(block) = mempool.blocks_queue.pop_front() {
+            mempool.delete_transactions(&block.get_transactions());
+            blockchain.add_block(block).await;
+        }
+        mempool.currently_bundling_block = false;
+    }
 }
 
 pub async fn try_bundle_block(
@@ -310,21 +299,6 @@ pub async fn try_bundle_block(
     } else {
         None
     }
-}
-
-pub async fn send_blocks_to_blockchain(
-    mempool_lock: Arc<RwLock<Mempool>>,
-    blockchain_lock: Arc<RwLock<Blockchain>>,
-) {
-    event!(Level::INFO, "process blocks...");
-    let mut mempool = mempool_lock.write().await;
-    mempool.currently_bundling_block = true;
-    let mut blockchain = blockchain_lock.write().await;
-    while let Some(block) = mempool.blocks_queue.pop_front() {
-        mempool.delete_transactions(&block.get_transactions());
-        blockchain.add_block(block).await;
-    }
-    mempool.currently_bundling_block = false;
 }
 
 //
@@ -388,10 +362,10 @@ pub async fn run(
                 match message {
 
                     //
-                   // attempt to bundle block
+                    // attempt to bundle block
                     //
                     MempoolMessage::LocalTryBundleBlock => {
-                let current_timestamp = create_timestamp();
+            let current_timestamp = create_timestamp();
                         if let Some(block) = try_bundle_block(
                             mempool_lock.clone(),
                             blockchain_lock.clone(),
@@ -407,27 +381,21 @@ pub async fn run(
                     //
                     // attempt to send to blockchain
                     //
-                    // ProcessBlocks will add blocks FIFO from the queue into blockchain
                     MempoolMessage::LocalNewBlock => {
-                        send_blocks_to_blockchain(mempool_lock.clone(), blockchain_lock.clone()).await;
+                        Mempool::send_blocks_to_blockchain(mempool_lock.clone(), blockchain_lock.clone()).await;
                     },
+
                 }
             }
 
 
         //
-         // global broadcast channel receivers
-         //
+        // global broadcast channel receivers
+        //
             Ok(message) = broadcast_channel_receiver.recv() => {
                 match message {
-                    //SaitoMessage::NetworkNewBlock { hash: _hash } => {
-                        // when network receives a new block
-                    //}
-                    //SaitoMessage::NetworkNewTransaction { transaction } => {
-                        // when network receives a new transaction
-                    //},
                     SaitoMessage::MinerNewGoldenTicket { ticket : golden_ticket } => {
-            // when miner produces golden ticket
+                       // when miner produces golden ticket
                         let mut mempool = mempool_lock.write().await;
                         mempool.add_golden_ticket(golden_ticket).await;
                     },
@@ -486,13 +454,44 @@ mod tests {
                 let mut mempool = test_manager.mempool_lock.write().await;
                 mempool.add_block(block);
             }
-            send_blocks_to_blockchain(mempool_lock.clone(), blockchain_lock.clone()).await;
+            Mempool::send_blocks_to_blockchain(mempool_lock.clone(), blockchain_lock.clone()).await;
         }
 
         // check chain consistence
         test_manager.check_blockchain().await;
     }
-
+    // TODO fix this test
+    // #[ignore]
+    // #[tokio::test]
+    // async fn mempool_bundle_and_send_blocks_to_blockchain_test() {
+    //     let wallet_lock = Arc::new(RwLock::new(Wallet::new()));
+    //     {
+    //         let mut wallet = wallet_lock.write().await;
+    //         wallet.load_keys("test/testwallet", Some("asdf"));
+    //     }
+    //     let mempool_lock = Arc::new(RwLock::new(Mempool::new(wallet_lock.clone())));
+    //     let blockchain_lock = Arc::new(RwLock::new(Blockchain::new(wallet_lock.clone())));
+    //     let publickey;
+    //     let mut prev_block;
+    //     {
+    //         let wallet = wallet_lock.read().await;
+    //         publickey = wallet.get_publickey();
+    //     }
+    //     add_vip_block(
+    //         publickey,
+    //         [0; 32],
+    //         blockchain_lock.clone(),
+    //         wallet_lock.clone(),
+    //     )
+    //     .await;
+    //     // make sure to create the mock_timestamp_generator after the VIP block.
+    //     let mut mock_timestamp_generator = MockTimestampGenerator::new();
+    //     {
+    //         let blockchain = blockchain_lock.read().await;
+    //         prev_block = blockchain.get_latest_block().unwrap().clone();
+    //         assert_eq!(prev_block.get_id(), 1);
+    //     }
+    // }
     /*******
         #[tokio::test]
         async fn mempool_bundle_and_send_blocks_to_blockchain_test() {
@@ -540,7 +539,7 @@ mod tests {
                         let mut mempool = mempool_lock.write().await;
                         mempool.add_block(block);
                     }
-                    send_blocks_to_blockchain(mempool_lock.clone(), blockchain_lock.clone()).await;
+                    Mempool::send_blocks_to_blockchain(mempool_lock.clone(), blockchain_lock.clone()).await;
                     let blockchain = blockchain_lock.read().await;
                     let latest_block = blockchain.get_latest_block().unwrap();
 
